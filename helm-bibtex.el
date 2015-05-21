@@ -1,4 +1,4 @@
-;;; helm-bibtex.el --- Helm source for managing BibTeX bibliographies
+;;; helm-bibtex.el --- A BibTeX bibliography manager based on Helm
 
 ;; Copyright 2014 Titus von der Malsburg <malsburg@posteo.de>
 
@@ -22,38 +22,26 @@
 
 ;;; Commentary:
 
-;; A helm source for managing BibTeX bibliographies.
+;; A BibTeX bibliography manager based on Helm.
 ;;
 ;; News:
-;; - 01/11/2015:
-;;   - Added resolution of cross-references.  Missing fields are
-;;     imported from the cross-referenced entry (useful for conference
-;;     abstracts).
-;;   - Editors are shown when there are no authors (useful for
-;;     conference proceedings).
-;;   - Fields that should be ignored when exporting BibTeX can be
-;;     configured via `helm-bibtex-no-export-fields' (useful to keep
-;;     private notes private).
-;; - 01/29/2015: Better formatting of plain text references
-;;   following the APA style guide.
-;; - 01/16/2015: The parsed bibliography is now cached which can
-;;   dramatically improve responsiveness with larger bibliographies.
+;; - 05/14/2015: Added support for multiple PDF directories.
+;; - 02/23/2015: Added a workaround for a bug in Emacs 24.3.1.  If you
+;;   didn't see any publications, this should fix it.
+;; See NEWS.org for old news.
 ;;
 ;; Key features:
 ;; - Quick access to your bibliography from within Emacs
+;; - Tightly integrated workflows
 ;; - Provides instant search results as you type
+;; - Powerful search expressions
+;; - Open the PDFs, URLs, or DOIs associated with an entry
+;; - Insert LaTeX cite commands, Ebib links, or Pandoc citations,
+;;   BibTeX entries, or plain text references at point, attach PDFs to
+;;   emails
+;; - Attach notes to publications
 ;; - Quick access to online bibliographic databases such as Pubmed,
 ;;   arXiv, Google Scholar, Library of Congress, etc.
-;; - Support for multiple BibTeX files
-;; - Open the PDF associated with an entry
-;; - Open the URL or DOI of an entry in the browser
-;; - Insert LaTeX cite command, ebib link, or pandoc citation
-;;   depending on document type
-;; - Insert BibTeX entry or plain text reference at point (useful when
-;;   sharing BibTeX with colleagues via email)
-;; - Attach PDF of entry to an email.
-;; - Add notes to an entry
-;; - Edit selected entry
 ;;
 ;; See the github page for details:
 ;;
@@ -100,17 +88,16 @@
   :group 'helm)
 
 (defcustom helm-bibtex-bibliography nil
-  "The list of BibTeX files that is used for searching. The first
-one will be used when creating new entries."
+  "The BibTeX file or list of BibTeX files."
   :group 'helm-bibtex
   :type '(choice file (repeat file)))
 
 (defcustom helm-bibtex-library-path nil
-  "The directory in which PDFs are stored.  Helm-bibtex
-assumes that the names of these PDFs are composed of the
-BibTeX-key plus a \".pdf\" suffix."
+  "A directory or list of directories in which PDFs are
+stored.  Helm-bibtex assumes that the names of these PDFs are
+composed of the BibTeX-key plus a \".pdf\" suffix."
   :group 'helm-bibtex
-  :type 'directory)
+  :type '(choice directory (repeat directory)))
 
 (defcustom helm-bibtex-pdf-open-function 'find-file
   "The function used for opening PDF files.  This can be an
@@ -266,9 +253,7 @@ actually exist."
   (mapc (lambda (file)
           (unless (f-exists? file)
                   (user-error "BibTeX file %s could not be found." file)))
-        (if (listp helm-bibtex-bibliography)
-            helm-bibtex-bibliography
-          (list helm-bibtex-bibliography))))
+        (-flatten (list helm-bibtex-bibliography))))
 
 (defun helm-bibtex-candidates ()
   "Reads the BibTeX files and returns a list of conses, one for
@@ -279,9 +264,7 @@ is the entry (only the fields listed above) as an alist."
   ;; Open configured bibliographies in temporary buffer:
   (with-temp-buffer 
     (mapc #'insert-file-contents
-          (if (listp helm-bibtex-bibliography)
-              helm-bibtex-bibliography
-            (list helm-bibtex-bibliography)))
+          (-flatten (list helm-bibtex-bibliography)))
     ;; Check hash of bibliography and reparse if necessary:
     (let ((bibliography-hash (secure-hash 'sha256 (current-buffer))))
       (unless (and helm-bibtex-cached-candidates
@@ -344,10 +327,8 @@ appended to the requested entry."
 
 (defun helm-bibtex-get-entry1 (entry-key)
   (with-temp-buffer
-    (mapc #'insert-file-contents 
-          (if (listp helm-bibtex-bibliography)
-              helm-bibtex-bibliography
-            (list helm-bibtex-bibliography)))
+    (mapc #'insert-file-contents
+          (-flatten (list helm-bibtex-bibliography)))
     (goto-char (point-min))
     (re-search-forward (concat "^@\\(" parsebib--bibtex-identifier
                                "\\)[[:space:]]*[\(\{][[:space:]]*"
@@ -365,6 +346,13 @@ appended to the requested entry."
    collect (helm-bibtex-prepare-entry entry
             (cons (if (assoc "author" entry) "author" "editor") fields))))
 
+(defun helm-bibtex-find-pdf (key)
+  "Searches in all directories in `helm-bibtex-library-path' for
+a PDF whose name is KEY + \".pdf\".  Returns the first matching PDF."
+  (-first 'f-exists?
+          (--map (f-join it (s-concat key ".pdf"))
+                 (-flatten (list helm-bibtex-library-path)))))
+  
 (defun helm-bibtex-prepare-entry (entry &optional fields)
   "Prepare ENTRY for display.
 ENTRY is an alist representing an entry as returned by
@@ -382,8 +370,7 @@ fields. If FIELDS is empty, all fields are kept. Also add a
       ;; Normalize case of entry type:
       (setcdr (assoc "=type=" entry) (downcase (cdr (assoc "=type=" entry))))
       ;; Check for PDF and notes:
-      (if (and helm-bibtex-library-path
-               (f-exists? (f-join helm-bibtex-library-path (s-concat entry-key ".pdf"))))
+      (if (helm-bibtex-find-pdf entry-key)
           (setq entry (cons (cons "=has-pdf=" helm-bibtex-pdf-symbol) entry)))
       (if (and helm-bibtex-notes-path
                (f-exists? (f-join helm-bibtex-notes-path
@@ -451,14 +438,15 @@ values."
 
 
 (defun helm-bibtex-open-pdf (_)
-  "Open the PDF associated with the entry using the function
-specified in `helm-bibtex-pdf-open-function',"
-  (let ((keys (helm-marked-candidates :with-wildcard t)))
-    (dolist (key keys)
-      (let ((path (f-join helm-bibtex-library-path (s-concat key ".pdf"))))
-        (if (f-exists? path)
-            (funcall helm-bibtex-pdf-open-function path)
-          (message "No PDF for this entry: %s" key))))))
+  "Open the PDFs associated with the marked entries using the
+function specified in `helm-bibtex-pdf-open-function'.  All paths
+in `helm-bibtex-library-path' are searched.  If there are several
+matching PDFs for an entry, the first is opened."
+  (--if-let
+      (-non-nil
+       (-map 'helm-bibtex-find-pdf (helm-marked-candidates :with-wildcard t)))
+      (-each it helm-bibtex-pdf-open-function)
+    (message "No PDF(s) found.")))
 
 (defun helm-bibtex-open-url-or-doi (_)
   "Open the associated URL or DOI in a browser."
@@ -494,9 +482,13 @@ specified in `helm-bibtex-pdf-open-function',"
           (--map (format "ebib:%s" it) keys)))
 
 (defun helm-bibtex-format-citation-org-link-to-PDF (keys)
-  "Formatter for org-links to PDF."
-  (s-join ", "
-   (--map (format "[[%s][%s]]" (f-join helm-bibtex-library-path (s-concat it ".pdf")) it) keys)))
+  "Formatter for org-links to PDF.  Uses first matching PDF if
+several are available.  Entries for which no PDF is available are
+omitted."
+  (s-join ", " (-non-nil
+                (--map (when (cdr it)
+                           (format "[[%s][%s]]" (cdr it) (car it)))
+                       (--map (cons it (helm-bibtex-find-pdf it)) keys)))))
 
 (defun helm-bibtex-insert-citation (_)
   "Insert citation at point.  The format depends on
@@ -505,8 +497,9 @@ specified in `helm-bibtex-pdf-open-function',"
         (format-function
          (cdr (or (assoc major-mode helm-bibtex-format-citation-functions)
                   (assoc 'default   helm-bibtex-format-citation-functions)))))
-    (insert
-     (funcall format-function keys))))
+    (with-helm-current-buffer
+      (insert
+       (funcall format-function keys)))))
 
 (defun helm-bibtex-insert-reference (_)
   "Insert a reference for each selected entry."
@@ -515,7 +508,8 @@ specified in `helm-bibtex-pdf-open-function',"
                 (s-word-wrap fill-column
                              (concat "\n- " (helm-bibtex-apa-format-reference it)))
                 keys)))
-   (insert "\n" (s-join "\n" refs) "\n")))
+    (with-helm-current-buffer
+      (insert "\n" (s-join "\n" refs) "\n"))))
 
 (defun helm-bibtex-apa-format-reference (key)
   "Returns a plain text reference in APA format for the
@@ -667,13 +661,15 @@ defined.  Surrounding curly braces are stripped."
 (defun helm-bibtex-insert-key (_)
   "Insert BibTeX key at point."
   (let ((keys (helm-marked-candidates :with-wildcard t)))
-    (insert
-      (funcall 'helm-bibtex-format-citation-default keys))))
+    (with-helm-current-buffer
+      (insert
+        (funcall 'helm-bibtex-format-citation-default keys)))))
 
 (defun helm-bibtex-insert-bibtex (_)
   "Insert BibTeX key at point."
   (let ((keys (helm-marked-candidates :with-wildcard t)))
-    (insert (s-join "\n" (--map (helm-bibtex-make-bibtex it) keys)))))
+    (with-helm-current-buffer
+      (insert (s-join "\n" (--map (helm-bibtex-make-bibtex it) keys))))))
 
 (defun helm-bibtex-make-bibtex (key)
   (let* ((entry (helm-bibtex-get-entry key))
@@ -692,13 +688,12 @@ defined.  Surrounding curly braces are stripped."
              (format "  %s = %s,\n" name value)))))
 
 (defun helm-bibtex-add-PDF-attachment (_)
-  "Attach the PDFs of the selected entries."
-  (let ((keys (helm-marked-candidates :with-wildcard t)))
-    (dolist (key keys)
-      (let ((path (f-join helm-bibtex-library-path (s-concat key ".pdf"))))
-        (if (f-exists? path)
-            (mml-attach-file path)
-          (message "No PDF for this entry: %s" key))))))
+  "Attach the PDFs of the selected entries where available."
+  (--if-let
+      (-non-nil
+       (-map 'helm-bibtex-find-pdf (helm-marked-candidates :with-wildcard t)))
+      (-each it 'mml-attach-file)
+    (message "No PDF(s) found.")))
 
 (defun helm-bibtex-edit-notes (key)
   "Open the notes associated with the entry using `find-file'."
@@ -729,9 +724,7 @@ defined.  Surrounding curly braces are stripped."
 (defun helm-bibtex-show-entry (key)
   "Show the entry in the BibTeX file."
   (catch 'break
-    (dolist (bibtex-file (if (listp helm-bibtex-bibliography)
-                             helm-bibtex-bibliography
-                           (list helm-bibtex-bibliography)))
+    (dolist (bibtex-file (-flatten (list helm-bibtex-bibliography)))
       (let ((buf (helm-bibtex-buffer-visiting bibtex-file)))
         (find-file bibtex-file)
         (goto-char (point-min))
@@ -769,9 +762,7 @@ defined.  Surrounding curly braces are stripped."
   "Compile list of fallback options.  These consist of the online
 resources defined in `helm-bibtex-fallback-options' plus one
 entry for each BibTeX file that will open that file for editing."
-  (let ((bib-files (if (listp helm-bibtex-bibliography)
-                       helm-bibtex-bibliography
-                     (list helm-bibtex-bibliography))))
+  (let ((bib-files (-flatten (list helm-bibtex-bibliography))))
     (-concat 
       (--map (cons (s-concat "Create new entry in " (f-filename it))
                    `(lambda () (find-file ,it) (goto-char (point-max))))
